@@ -1,11 +1,11 @@
-import 'dotenv/config';
+import "dotenv/config";
 
 async function bootstrap() {
   try {
-    const { startServer } = await import('./src/server.ts');
+    const { startServer } = await import("./src/server.ts");
     await startServer();
   } catch (error) {
-    console.error('Unable to start the server:', error);
+    console.error("Unable to start the server:", error);
     process.exit(1);
   }
 }

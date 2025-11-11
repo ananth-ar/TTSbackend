@@ -1,9 +1,19 @@
+import { decode, encode } from "gpt-tokenizer";
+
 export function countWords(text: string): number {
   if (!text) {
     return 0;
   }
 
   return text.trim().split(/\s+/).filter(Boolean).length;
+}
+
+export function countTokens(text: string): number {
+  if (!text) {
+    return 0;
+  }
+
+  return encode(text).length;
 }
 
 export function splitTextIntoChunks(text: string, chunkSize: number): string[] {
@@ -15,7 +25,34 @@ export function splitTextIntoChunks(text: string, chunkSize: number): string[] {
   const chunks: string[] = [];
   for (let index = 0; index < words.length; index += chunkSize) {
     const chunkWords = words.slice(index, index + chunkSize);
-    chunks.push(chunkWords.join(' '));
+    chunks.push(chunkWords.join(" "));
+  }
+
+  return chunks;
+}
+
+export function splitTextIntoTokenChunks(
+  text: string,
+  tokensPerChunk: number
+): string[] {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return [];
+  }
+
+  if (!Number.isFinite(tokensPerChunk) || tokensPerChunk <= 0) {
+    throw new Error("tokensPerChunk must be a positive integer.");
+  }
+
+  const tokenIds = encode(trimmed);
+  if (!tokenIds.length) {
+    return [];
+  }
+
+  const chunks: string[] = [];
+  for (let index = 0; index < tokenIds.length; index += tokensPerChunk) {
+    const chunkTokens = tokenIds.slice(index, index + tokensPerChunk);
+    chunks.push(decode(chunkTokens));
   }
 
   return chunks;
