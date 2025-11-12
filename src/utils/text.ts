@@ -35,16 +35,11 @@ export function splitTextIntoTokenChunks(
   text: string,
   tokensPerChunk: number
 ): string[] {
-  const trimmed = text.trim();
-  if (!trimmed) {
-    return [];
-  }
-
   if (!Number.isFinite(tokensPerChunk) || tokensPerChunk <= 0) {
     throw new Error("tokensPerChunk must be a positive integer.");
   }
 
-  const tokenIds = encode(trimmed);
+  const tokenIds = encode(text);
   if (!tokenIds.length) {
     return [];
   }

@@ -5,7 +5,7 @@ import { readdir } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { MAX_WORD_COUNT, OUTPUT_DIR } from "../config.ts";
-import { processLlmTextProcessingJob } from "../services/llmTextProcessingService.ts";
+import { processTexttoSpeechJob } from "../services/processTexttoSpeechService.ts";
 import { countWords } from "../utils/text.ts";
 
 const router = Router();
@@ -101,8 +101,8 @@ router.post("/tts", async (req: Request, res: Response) => {
     typeof fileName === "string" ? fileName.trim() : undefined;
   const selectedVoice = typeof voiceName === "string" ? voiceName : undefined;
 
-  console.log(`[Job ${jobId}] Dispatching llmtextprocessing job.`);
-  processLlmTextProcessingJob({
+  console.log(`[Job ${jobId}] Dispatching processTexttoSpeech job.`);
+  processTexttoSpeechJob({
     text: normalizedText,
     voiceName: selectedVoice,
     requestedFileName,
@@ -120,11 +120,14 @@ router.post("/tts", async (req: Request, res: Response) => {
       }
     })
     .catch((error) => {
-      console.error(`[Job ${jobId}] llmtextprocessing pipeline failed.`, error);
+      console.error(
+        `[Job ${jobId}] processTexttoSpeech pipeline failed.`,
+        error
+      );
     });
 
   res.status(202).json({
-    message: "llmtextprocessing job started.",
+    message: "processTexttoSpeech job started.",
     jobId,
   });
 });

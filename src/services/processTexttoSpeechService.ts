@@ -1,30 +1,30 @@
-import { generateSsmlFileFromLlmText } from "./ssmlConversionService.ts";
+import { generateSsmlTextFileFromLlm } from "./ssmlConversionService.ts";
 import {
   synthesizeAudioFromSsmlChunks,
   type PersistedAudio,
 } from "./ttsService.ts";
 
-export interface LlmTextProcessingParams {
+export interface processTexttoSpeechParams {
   text: string;
   voiceName?: string;
   requestedFileName?: string;
   jobId: string;
 }
 
-export interface LlmTextProcessingResult {
+export interface processTexttoSpeechResult {
   ssmlFileName: string;
   audio?: PersistedAudio;
   chunkCount: number;
 }
 
-export async function processLlmTextProcessingJob(
-  params: LlmTextProcessingParams
-): Promise<LlmTextProcessingResult> {
+export async function processTexttoSpeechJob(
+  params: processTexttoSpeechParams
+): Promise<processTexttoSpeechResult> {
   const { text, voiceName, requestedFileName, jobId } = params;
 
-  console.log(`[Job ${jobId}] Starting llmtextprocessing pipeline.`);
+  console.log(`[Job ${jobId}] Starting processTexttoSpeech pipeline.`);
 
-  const ssmlResult = await generateSsmlFileFromLlmText(
+  const ssmlResult = await generateSsmlTextFileFromLlm(
     text,
     requestedFileName ? `${requestedFileName}-ssml` : undefined,
     { jobId }
