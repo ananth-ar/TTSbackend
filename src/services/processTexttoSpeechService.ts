@@ -1,8 +1,9 @@
 import { generateSsmlTextFileFromLlm } from "./ssmlConversionService.ts";
 import {
-  synthesizeAudioFromSsmlChunks,
+  // synthesizeAudioFromSsmlChunks,
   type PersistedAudio,
 } from "./ttsService.ts";
+import { synthesizeAudioFromSsmlChunksBatch } from "./ttsBatchService.ts";
 
 export interface processTexttoSpeechParams {
   text: string;
@@ -36,7 +37,13 @@ export async function processTexttoSpeechJob(
 
   let audio: PersistedAudio | undefined;
   try {
-    audio = await synthesizeAudioFromSsmlChunks(
+    // audio = await synthesizeAudioFromSsmlChunks(
+    //   ssmlResult.chunks,
+    //   voiceName,
+    //   requestedFileName,
+    //   { jobId }
+    // );
+    audio = await synthesizeAudioFromSsmlChunksBatch(
       ssmlResult.chunks,
       voiceName,
       requestedFileName,
