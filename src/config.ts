@@ -40,6 +40,9 @@ export const GEMINI_TTS_REQUESTS_PER_DAY = Number.parseInt(
   process.env.GEMINI_TTS_RPD ?? "100",
   10
 );
+const GEMINI_TTS_MODE_ENV = process.env.GEMINI_TTS_MODE?.toLowerCase();
+export const GEMINI_TTS_MODE: "stream" | "batch" =
+  GEMINI_TTS_MODE_ENV === "batch" ? "batch" : "stream";
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 

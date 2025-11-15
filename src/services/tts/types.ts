@@ -12,6 +12,14 @@ export interface ProcessTexttoSpeechResult {
   requestDirectory: string;
 }
 
+export type GeminiTtsGenerationMode = "stream" | "batch";
+
+export interface SynthesizeAudioOptions {
+  jobId?: string;
+  totalChunkCount?: number;
+  modeOverride?: GeminiTtsGenerationMode;
+}
+
 export interface RequestLayout {
   baseName: string;
   requestDir: string;

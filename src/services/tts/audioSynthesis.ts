@@ -3,6 +3,7 @@ import path from "node:path";
 import { readFile, writeFile } from "node:fs/promises";
 
 import {
+  GEMINI_TTS_MODE,
   GEMINI_TTS_REQUESTS_PER_MINUTE,
   GEMINI_TTS_TOKENS_PER_MINUTE,
   DEFAULT_VOICE,
@@ -17,7 +18,12 @@ import type {
   ChunkAudioJobResult,
   PersistedAudio,
   SsmlChunkTask,
+  SynthesizeAudioOptions,
 } from "./types.ts";
+import {
+  synthesizeAudioFromSsmlChunksBatch,
+  type BatchSynthesizeAudioOptions,
+} from "./batchAudioSynthesis.ts";
 
 interface InlineDataPart {
   inlineData?: {
@@ -32,7 +38,24 @@ const MIN_WAIT_MS = 100;
 export async function synthesizeAudioFromSsmlChunks(
   chunkTasks: SsmlChunkTask[],
   customVoice?: string,
-  options?: { jobId?: string; totalChunkCount?: number }
+  options?: SynthesizeAudioOptions
+): Promise<ChunkAudioJobResult[]> {
+  const preferredMode = options?.modeOverride ?? GEMINI_TTS_MODE;
+  if (preferredMode === "batch") {
+    return synthesizeAudioFromSsmlChunksBatch(
+      chunkTasks,
+      customVoice,
+      options as BatchSynthesizeAudioOptions
+    );
+  }
+
+  return synthesizeAudioFromSsmlChunksStream(chunkTasks, customVoice, options);
+}
+
+async function synthesizeAudioFromSsmlChunksStream(
+  chunkTasks: SsmlChunkTask[],
+  customVoice?: string,
+  options?: SynthesizeAudioOptions
 ): Promise<ChunkAudioJobResult[]> {
   if (!chunkTasks.length) {
     throw new Error("No SSML chunk tasks were provided for synthesis.");
