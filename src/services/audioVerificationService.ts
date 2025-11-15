@@ -12,7 +12,7 @@ import {
   type WordDiffEntry,
 } from "../utils/text.ts";
 
-const DEFAULT_MATCH_THRESHOLD = 85;
+const DEFAULT_MATCH_THRESHOLD = 70;
 const MATCH_THRESHOLD_ENV = Number.parseFloat(
   process.env.AUDIO_MATCH_THRESHOLD ?? ""
 );
