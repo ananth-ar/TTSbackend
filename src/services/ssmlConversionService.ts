@@ -24,6 +24,7 @@ export interface SsmlFileResult {
 
 export interface SsmlConversionOptions {
   jobId?: string;
+  destinationDir?: string;
 }
 
 export async function generateSsmlTextFileFromLlm(
@@ -31,7 +32,8 @@ export async function generateSsmlTextFileFromLlm(
   requestedFileName?: string,
   options?: SsmlConversionOptions
 ): Promise<SsmlFileResult> {
-  await ensureDirectory(OUTPUT_DIR);
+  const destinationDir = options?.destinationDir ?? OUTPUT_DIR;
+  await ensureDirectory(destinationDir);
   const jobLabel = createJobLabel(options?.jobId, "SSML");
 
   console.log(
@@ -46,7 +48,7 @@ export async function generateSsmlTextFileFromLlm(
   console.log(`${jobLabel}Split text into ${chunks.length} chunk(s).`);
 
   const fileName = createAudioFileName("txt", requestedFileName);
-  const filePath = path.join(OUTPUT_DIR, fileName);
+  const filePath = path.join(destinationDir, fileName);
   const ssmlOutputs: string[] = [];
 
   for (const [index, chunkText] of chunks.entries()) {

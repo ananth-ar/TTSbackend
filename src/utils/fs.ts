@@ -23,7 +23,7 @@ function sanitizeExtension(extension: string): string {
   return extension.replace(/[^a-z0-9]/gi, "").toLowerCase() || "wav";
 }
 
-function sanitizeRequestedFileName(rawName?: string): string | undefined {
+export function sanitizeRequestedFileName(rawName?: string): string | undefined {
   if (!rawName || typeof rawName !== "string") {
     return undefined;
   }

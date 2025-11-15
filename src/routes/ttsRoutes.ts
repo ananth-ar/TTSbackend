@@ -57,6 +57,7 @@ router.get("/audio/:fileName", async (req: Request, res: Response) => {
   }
 });
 
+// /tts: validates job input, kicks async pipeline, responds immediately with jobId.
 router.post("/tts", async (req: Request, res: Response) => {
   console.log("POST /tts");
   const { text, voiceName, fileName } = req.body as {

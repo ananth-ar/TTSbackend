@@ -1,6 +1,6 @@
 import mime from "mime";
 import path from "node:path";
-import { writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 
 import {
   GEMINI_TTS_REQUESTS_PER_MINUTE,
@@ -8,12 +8,12 @@ import {
   aiClient,
   DEFAULT_VOICE,
   MODEL_ID,
-  OUTPUT_DIR,
 } from "../config.ts";
-import { createAudioFileName, ensureDirectory } from "../utils/fs.ts";
+import { ensureDirectory } from "../utils/fs.ts";
 import type { AudioChunk } from "../utils/audio.ts";
 import { combineAudioChunks, convertBase64ToWav } from "../utils/audio.ts";
 import { countTokens } from "../utils/text.ts";
+import { writeJsonFile } from "../utils/json.ts";
 
 interface InlineDataPart {
   inlineData?: {
@@ -28,87 +28,212 @@ export interface PersistedAudio {
   mimeType: string;
 }
 
+export interface ChunkCheckpoint {
+  chunkIndex: number;
+  chunkDir: string;
+  chunkLabel: string;
+  ssmlFilePath: string;
+  textFilePath: string;
+  audioStatusFilePath: string;
+  audioMetadataFilePath: string;
+  accuracyStatusFilePath: string;
+}
+
+export interface SsmlChunkTask extends ChunkCheckpoint {
+  attempt: number;
+}
+
+export interface ChunkAudioJobResult {
+  chunkIndex: number;
+  attempt: number;
+  success: boolean;
+  audioFilePath?: string;
+  mimeType?: string;
+  error?: string;
+}
+
 export interface SynthesizeAudioOptions {
   jobId?: string;
+  totalChunkCount?: number;
 }
 
 const REQUEST_WINDOW_MS = 60_000;
 const MIN_WAIT_MS = 100;
 
 export async function synthesizeAudioFromSsmlChunks(
-  ssmlChunks: string[],
+  chunkTasks: SsmlChunkTask[],
   customVoice?: string,
-  requestedFileName?: string,
   options?: SynthesizeAudioOptions
-): Promise<PersistedAudio> {
-  await ensureDirectory(OUTPUT_DIR);
-
-  if (!ssmlChunks.length) {
-    throw new Error("No SSML chunks were provided for synthesis.");
+): Promise<ChunkAudioJobResult[]> {
+  if (!chunkTasks.length) {
+    throw new Error("No SSML chunk tasks were provided for synthesis.");
   }
 
   const voice = customVoice ?? DEFAULT_VOICE;
   const jobLabel = createJobLabel(options?.jobId, "TTS");
+  const totalChunkCount =
+    options?.totalChunkCount ??
+    chunkTasks.reduce((max, task) => Math.max(max, task.chunkIndex), 0);
+
   console.log(
-    `${jobLabel}Starting audio synthesis with ${ssmlChunks.length} SSML chunk(s) using voice "${voice}".`
+    `${jobLabel}Starting audio synthesis for ${chunkTasks.length} chunk task(s) using voice "${voice}".`
   );
 
-  const audioChunks: AudioChunk[] = [];
+  const results: ChunkAudioJobResult[] = [];
 
-  for (const [index, chunk] of ssmlChunks.entries()) {
-    const chunkNumber = index + 1;
-    const tokensNeeded = Math.max(1, countTokens(chunk));
+  for (const task of chunkTasks) {
+    const chunkNumber = task.chunkIndex;
+    const chunkLabel = `${chunkNumber}/${totalChunkCount}`;
+
+    let ssml: string | undefined;
+    try {
+      ssml = await readFile(task.ssmlFilePath, { encoding: "utf8" });
+    } catch (error) {
+      const message = `${jobLabel}Unable to read SSML for chunk ${chunkLabel}.`;
+      console.error(message, error);
+      await writeJsonFile(task.audioStatusFilePath, {
+        status: "failed",
+        attempt: task.attempt,
+        updatedAt: new Date().toISOString(),
+        message,
+      });
+      results.push({
+        chunkIndex: chunkNumber,
+        attempt: task.attempt,
+        success: false,
+        error: message,
+      });
+      continue;
+    }
+
+    if (!ssml?.trim()) {
+      const message = `${jobLabel}Chunk ${chunkLabel} SSML content is empty.`;
+      console.error(message);
+      await writeJsonFile(task.audioStatusFilePath, {
+        status: "failed",
+        attempt: task.attempt,
+        updatedAt: new Date().toISOString(),
+        message,
+      });
+      results.push({
+        chunkIndex: chunkNumber,
+        attempt: task.attempt,
+        success: false,
+        error: message,
+      });
+      continue;
+    }
+
+    const tokensNeeded = Math.max(1, countTokens(ssml));
     console.log(
-      `${jobLabel}Queueing chunk ${chunkNumber}/${ssmlChunks.length} (~${tokensNeeded} tokens).`
+      `${jobLabel}Queueing chunk ${chunkLabel} (~${tokensNeeded} tokens).`
     );
+
+    await writeJsonFile(task.audioStatusFilePath, {
+      status: "in-progress",
+      attempt: task.attempt,
+      updatedAt: new Date().toISOString(),
+      message: "Audio generation started.",
+    });
 
     await ttsRateLimiter.waitForTurn(
       tokensNeeded,
       jobLabel,
       chunkNumber,
-      ssmlChunks.length
+      totalChunkCount
     );
 
     try {
       const chunkAudio = await generateAudioFromSsml(
-        chunk,
+        ssml,
         voice,
         jobLabel,
         chunkNumber,
-        ssmlChunks.length
+        totalChunkCount
       );
-      audioChunks.push(chunkAudio);
+
+      const extension = mime.getExtension(chunkAudio.mimeType) ?? "wav";
+      const audioFileName = `chunk-${chunkNumber}.${extension}`;
+      const audioFilePath = path.join(task.chunkDir, audioFileName);
+      await writeFile(audioFilePath, chunkAudio.buffer);
+
+      await writeJsonFile(task.audioMetadataFilePath, {
+        chunkIndex: chunkNumber,
+        attempt: task.attempt,
+        mimeType: chunkAudio.mimeType,
+        fileName: audioFileName,
+        updatedAt: new Date().toISOString(),
+      });
+
+      await writeJsonFile(task.audioStatusFilePath, {
+        status: "success",
+        attempt: task.attempt,
+        updatedAt: new Date().toISOString(),
+        message: `Audio chunk saved (${chunkAudio.mimeType}).`,
+      });
+
       console.log(
-        `${jobLabel}Chunk ${chunkNumber}/${ssmlChunks.length} buffered (${chunkAudio.mimeType}).`
+        `${jobLabel}Chunk ${chunkLabel} saved to ${audioFilePath} (${chunkAudio.mimeType}).`
       );
+
+      results.push({
+        chunkIndex: chunkNumber,
+        attempt: task.attempt,
+        success: true,
+        audioFilePath,
+        mimeType: chunkAudio.mimeType,
+      });
     } catch (error) {
-      console.error(
-        `${jobLabel}Chunk ${chunkNumber}/${ssmlChunks.length} failed. Halting further synthesis.`,
-        error
-      );
-      break;
+      const message = `${jobLabel}Chunk ${chunkLabel} synthesis failed.`;
+      console.error(message, error);
+      await writeJsonFile(task.audioStatusFilePath, {
+        status: "failed",
+        attempt: task.attempt,
+        updatedAt: new Date().toISOString(),
+        message: error instanceof Error ? error.message : message,
+      });
+      results.push({
+        chunkIndex: chunkNumber,
+        attempt: task.attempt,
+        success: false,
+        error: error instanceof Error ? error.message : message,
+      });
     }
   }
 
-  if (!audioChunks.length) {
-    throw new Error("No audio chunks were generated by Gemini.");
+  return results;
+}
+
+export async function combineChunkAudioFiles(
+  chunkFiles: Array<{ filePath: string; mimeType: string }>,
+  finalFilePath: string,
+  options?: { jobId?: string }
+): Promise<PersistedAudio> {
+  if (!chunkFiles.length) {
+    throw new Error("No chunk files available to merge.");
   }
 
-  if (audioChunks.length < ssmlChunks.length) {
-    console.warn(
-      `${jobLabel}Audio synthesis completed partially (${audioChunks.length}/${ssmlChunks.length}).`
-    );
+  const jobLabel = createJobLabel(options?.jobId, "TTS-MERGE");
+  const audioChunks: AudioChunk[] = [];
+
+  for (const chunk of chunkFiles) {
+    const buffer = await readFile(chunk.filePath);
+    audioChunks.push({
+      buffer,
+      mimeType: chunk.mimeType,
+    });
   }
 
   const combinedAudio = combineAudioChunks(audioChunks);
-  const extension = mime.getExtension(combinedAudio.mimeType) ?? "wav";
-  const fileName = createAudioFileName(extension, requestedFileName);
-  const filePath = path.join(OUTPUT_DIR, fileName);
+  await ensureDirectory(path.dirname(finalFilePath));
+  await writeFile(finalFilePath, combinedAudio.buffer);
+  console.log(`${jobLabel}Final audio file saved to ${finalFilePath}`);
 
-  await writeFile(filePath, combinedAudio.buffer);
-  console.log(`${jobLabel}Audio file saved to ${filePath}`);
-
-  return { fileName, filePath, mimeType: combinedAudio.mimeType };
+  return {
+    fileName: path.basename(finalFilePath),
+    filePath: finalFilePath,
+    mimeType: combinedAudio.mimeType,
+  };
 }
 
 async function generateAudioFromSsml(

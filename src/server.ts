@@ -4,6 +4,7 @@ import express, { type Express } from "express";
 
 import { HOST, OUTPUT_DIR, PORT } from "./config.ts";
 import ttsRoutes from "./routes/ttsRoutes.ts";
+import restartRoutes from "./routes/restart/index.ts";
 import { ensureDirectory } from "./utils/fs.ts";
 
 function getNetworkUrls(port: number): string[] {
@@ -34,6 +35,7 @@ export async function createApp(): Promise<Express> {
   });
 
   app.use("/api", ttsRoutes);
+  app.use("/api", restartRoutes);
 
   return app;
 }
