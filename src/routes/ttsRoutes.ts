@@ -5,7 +5,14 @@ import { readdir } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { MAX_WORD_COUNT, OUTPUT_DIR } from "../config.ts";
+import { transcribeAndCompareAudio } from "../services/audioVerificationService.ts";
 import { processTexttoSpeechJob } from "../services/processTexttoSpeechService.ts";
+import {
+  AUDIO_UPLOAD_LIMIT_MB_DISPLAY,
+  MAX_AUDIO_UPLOAD_BYTES,
+  RequestValidationError,
+  extractAudioVerificationPayload,
+} from "./audioVerificationRequest.ts";
 import { countWords } from "../utils/text.ts";
 
 const router = Router();
@@ -130,6 +137,57 @@ router.post("/tts", async (req: Request, res: Response) => {
     message: "processTexttoSpeech job started.",
     jobId,
   });
+});
+
+router.post("/verify-audio", async (req: Request, res: Response) => {
+  console.log("POST /verify-audio");
+  try {
+    const payload = await extractAudioVerificationPayload(req);
+    if (payload.audioBuffer.length > MAX_AUDIO_UPLOAD_BYTES) {
+      throw new RequestValidationError(
+        `Audio file exceeds the ${AUDIO_UPLOAD_LIMIT_MB_DISPLAY}MB limit.`,
+        413
+      );
+    }
+
+    const comparison = await transcribeAndCompareAudio({
+      expectedText: payload.text,
+      audioBuffer: payload.audioBuffer,
+      fileName: payload.fileName,
+      mimeType: payload.mimeType,
+    });
+    const { missingWords: _missingWords, extraWords: _extraWords, ...wordStats } =
+      comparison.wordStats;
+
+    res.json({
+      success: comparison.success,
+      matchPercent: comparison.matchPercent,
+      matchThreshold: comparison.matchThreshold,
+      providedText: comparison.providedText,
+      transcription: comparison.transcription,
+      normalizedProvidedText: comparison.normalizedProvidedText,
+      normalizedTranscription: comparison.normalizedTranscription,
+      wordStats,
+    });
+  } catch (error) {
+    if (error instanceof RequestValidationError) {
+      res.status(error.statusCode).json({ error: error.message });
+      return;
+    }
+
+    if (
+      error instanceof Error &&
+      /HF_TOKEN/i.test(error.message ?? "")
+    ) {
+      res.status(500).json({ error: error.message });
+      return;
+    }
+
+    console.error("Failed to verify audio transcription:", error);
+    res.status(500).json({
+      error: "Unable to verify audio transcription.",
+    });
+  }
 });
 
 export default router;

@@ -21,6 +21,7 @@
   },
   "dependencies": {
     "@google/genai": "^1.28.0",
+    "@huggingface/inference": "^4.13.3",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
     "express": "^5.1.0",

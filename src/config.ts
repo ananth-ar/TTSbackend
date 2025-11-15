@@ -1,5 +1,10 @@
 import path from "node:path";
 import { GoogleGenAI } from "@google/genai";
+import {
+  InferenceClient,
+  PROVIDERS_OR_POLICIES,
+  type InferenceProviderOrPolicy,
+} from "@huggingface/inference";
 import OpenAI from "openai";
 
 export const OUTPUT_DIR = path.resolve(process.cwd(), "output");
@@ -55,3 +60,22 @@ if (!OPENAI_API_KEY) {
 export const openaiClient = new OpenAI({
   apiKey: OPENAI_API_KEY,
 });
+
+const HF_TOKEN = process.env.HF_TOKEN;
+
+export const hfInferenceClient = HF_TOKEN
+  ? new InferenceClient(HF_TOKEN)
+  : undefined;
+
+export const HF_WHISPER_MODEL =
+  process.env.HF_WHISPER_MODEL ?? "openai/whisper-large-v3";
+
+const HF_INFERENCE_PROVIDER_ENV = process.env.HF_INFERENCE_PROVIDER?.toLowerCase();
+
+export const HF_INFERENCE_PROVIDER: InferenceProviderOrPolicy =
+  (HF_INFERENCE_PROVIDER_ENV &&
+    (PROVIDERS_OR_POLICIES as readonly string[]).includes(
+      HF_INFERENCE_PROVIDER_ENV
+    ) &&
+    (HF_INFERENCE_PROVIDER_ENV as InferenceProviderOrPolicy)) ||
+  "hf-inference";
