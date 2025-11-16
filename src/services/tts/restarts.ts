@@ -111,7 +111,14 @@ export async function restartChunkCheckpoint(
 export async function restartAudioCheckpoint(
   params: RestartAudioParams
 ): Promise<RestartAudioResult> {
-  const { targetName, chunkIndices, regenerateAll, voiceName, jobId } = params;
+  const {
+    targetName,
+    chunkIndices,
+    regenerateAll,
+    regenerateOnlyMissing,
+    voiceName,
+    jobId,
+  } = params;
   const layout = await resolveExistingRequestLayout(targetName);
   const metadata = await readRequestMetadata(layout);
   const chunkStates = await loadChunkProcessingStates(layout.requestDir);
@@ -122,12 +129,22 @@ export async function restartAudioCheckpoint(
 
   const totalChunks = chunkStates.length;
   const filter = validateChunkIndices(totalChunks, chunkIndices);
-  const targets = selectChunkTargets(
+  const filterSet = filter?.length ? new Set(filter) : undefined;
+  const defaultTargets = selectChunkTargets(
     chunkStates,
     filter,
     regenerateAll ?? false,
     (state) => !state.audioReady
   );
+
+  const missingTargets = chunkStates.filter((state) => {
+    if (filterSet && !filterSet.has(state.checkpoint.chunkIndex)) {
+      return false;
+    }
+    return !state.audioReady;
+  });
+
+  const targets = regenerateOnlyMissing ? missingTargets : defaultTargets;
 
   if (!targets.length) {
     throw new Error(

@@ -6,6 +6,7 @@ import {
   type InferenceProviderOrPolicy,
 } from "@huggingface/inference";
 import OpenAI from "openai";
+import type { GeminiTtsGenerationMode } from "./services/tts/types.ts";
 
 export const OUTPUT_DIR = path.resolve(process.cwd(), "output");
 export const PORT = Number.parseInt(process.env.PORT ?? "3000", 10);
@@ -41,8 +42,17 @@ export const GEMINI_TTS_REQUESTS_PER_DAY = Number.parseInt(
   10
 );
 const GEMINI_TTS_MODE_ENV = process.env.GEMINI_TTS_MODE?.toLowerCase();
-export const GEMINI_TTS_MODE: "stream" | "batch" =
-  GEMINI_TTS_MODE_ENV === "batch" ? "batch" : "stream";
+const GEMINI_TTS_MODES: Record<string, GeminiTtsGenerationMode> = {
+  stream: "stream",
+  batch: "batch",
+  parallel: "parallel",
+};
+export const GEMINI_TTS_MODE: GeminiTtsGenerationMode =
+  GEMINI_TTS_MODES[GEMINI_TTS_MODE_ENV ?? ""] ?? "stream";
+export const GEMINI_TTS_PARALLEL_CONCURRENCY = Number.parseInt(
+  process.env.GEMINI_TTS_PARALLEL_CONCURRENCY ?? "10",
+  10
+);
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
@@ -73,7 +83,8 @@ export const hfInferenceClient = HF_TOKEN
 export const HF_WHISPER_MODEL =
   process.env.HF_WHISPER_MODEL ?? "openai/whisper-large-v3";
 
-const HF_INFERENCE_PROVIDER_ENV = process.env.HF_INFERENCE_PROVIDER?.toLowerCase();
+const HF_INFERENCE_PROVIDER_ENV =
+  process.env.HF_INFERENCE_PROVIDER?.toLowerCase();
 
 export const HF_INFERENCE_PROVIDER: InferenceProviderOrPolicy =
   (HF_INFERENCE_PROVIDER_ENV &&

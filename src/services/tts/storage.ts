@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { readdir, rm, writeFile } from "node:fs/promises";
+import { readdir, rm, writeFile, readFile } from "node:fs/promises";
 import path from "node:path";
 
 import { OUTPUT_DIR } from "../../config.ts";
@@ -191,10 +191,10 @@ export async function loadChunkProcessingStates(
   for (const checkpoint of checkpoints) {
     const audioStatus =
       (await readJsonFile<StatusSnapshot>(checkpoint.audioStatusFilePath)) ??
-      {};
+      (await repairCheckpointStatusFile(checkpoint, "audio"));
     const accuracyStatus =
       (await readJsonFile<StatusSnapshot>(checkpoint.accuracyStatusFilePath)) ??
-      {};
+      (await repairCheckpointStatusFile(checkpoint, "accuracy"));
     const audioMetadata =
       await readJsonFile<AudioMetadataSnapshot>(
         checkpoint.audioMetadataFilePath
@@ -307,4 +307,55 @@ function normalizeTargetName(targetName: string): string {
   }
   const lastSegment = trimmed.replace(/\\/g, "/").split("/").pop() ?? trimmed;
   return lastSegment;
+}
+
+async function repairCheckpointStatusFile(
+  checkpoint: ChunkCheckpoint,
+  type: "audio" | "accuracy"
+): Promise<StatusSnapshot> {
+  await ensureSsmlChunkSnapshot(checkpoint);
+  const snapshot: StatusSnapshot = {
+    status: "pending",
+    attempt: 0,
+    updatedAt: new Date().toISOString(),
+    message: "Reinitialized after corrupted data.",
+  };
+  const targetPath =
+    type === "audio"
+      ? checkpoint.audioStatusFilePath
+      : checkpoint.accuracyStatusFilePath;
+  await writeJsonFile(targetPath, snapshot);
+  console.warn(
+    `Recreated ${type} status file for chunk ${checkpoint.chunkIndex} at ${targetPath}.`
+  );
+  return snapshot;
+}
+
+async function ensureSsmlChunkSnapshot(
+  checkpoint: ChunkCheckpoint
+): Promise<void> {
+  try {
+    const payload = await readFile(checkpoint.ssmlFilePath, {
+      encoding: "utf8",
+    });
+    if (!payload.trim()) {
+      throw new Error(
+        `Chunk ${checkpoint.chunkIndex} is missing SSML content at ${checkpoint.ssmlFilePath}. Regenerate SSML before continuing.`
+      );
+    }
+  } catch (error) {
+    if (
+      error &&
+      typeof error === "object" &&
+      "code" in error &&
+      (error as NodeJS.ErrnoException).code === "ENOENT"
+    ) {
+      throw new Error(
+        `Chunk ${checkpoint.chunkIndex} is missing ${path.basename(
+          checkpoint.ssmlFilePath
+        )}. Run the SSML checkpoint before retrying.`
+      );
+    }
+    throw error;
+  }
 }

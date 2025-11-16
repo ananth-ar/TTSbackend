@@ -12,30 +12,55 @@ import {
 const router = Router();
 
 // Payload: { targetName: string, text?: string, voiceName?: string }
-router.post("/tts/restart/ssml", async (req: Request, res: Response) => {
+router.post("/tts/restart/ssml", (req: Request, res: Response) => {
   const jobId = randomUUID();
+  let payload:
+    | {
+        targetName: string;
+        text?: string;
+        voiceName?: string;
+      }
+    | undefined;
   try {
-    const targetName = requireTargetName(req.body);
-    const text = parseOptionalString(req.body?.text, "`text`");
-    const voiceName = parseOptionalString(req.body?.voiceName, "`voiceName`");
-
-    const result = await restartSsmlCheckpoint({
-      targetName,
-      text,
-      voiceName,
-      jobId,
-    });
-
-    res.json({
-      jobId,
-      requestDirectory: result.requestDirectory,
-      ssmlFileName: result.ssmlFileName,
-      chunkCount: result.chunkCount,
-      manifestPath: result.manifestPath,
-    });
+    payload = {
+      targetName: requireTargetName(req.body),
+      text: parseOptionalString(req.body?.text, "`text`"),
+      voiceName: parseOptionalString(req.body?.voiceName, "`voiceName`"),
+    };
   } catch (error) {
     handleRestartError(res, "ssml", jobId, error);
+    return;
   }
+
+  if (!payload) {
+    return;
+  }
+
+  const { targetName, text, voiceName } = payload;
+
+  res.status(202).json({
+    jobId,
+    status: "processing",
+    message: "SSML regeneration scheduled.",
+  });
+
+  restartSsmlCheckpoint({
+    targetName,
+    text,
+    voiceName,
+    jobId,
+  })
+    .then((result) => {
+      console.log(
+        `[Job ${jobId}][ssml] Restart completed. Check ${result.requestDirectory} for updated files.`
+      );
+    })
+    .catch((error) => {
+      console.error(
+        `[Job ${jobId}][ssml] checkpoint restart failed after acknowledgement.`,
+        error
+      );
+    });
 });
 
 // Payload: { targetName: string, chunkIndices?: number[] }
@@ -62,59 +87,123 @@ router.post("/tts/restart/chunks", async (req: Request, res: Response) => {
   }
 });
 
-// Payload: { targetName: string, chunkIndices?: number[], voiceName?: string, regenerateAll?: boolean }
-router.post("/tts/restart/audio", async (req: Request, res: Response) => {
+// Payload: { targetName: string, chunkIndices?: number[], voiceName?: string, regenerateAll?: boolean, regenerateOnlyMissing?: boolean }
+router.post("/tts/restart/audio", (req: Request, res: Response) => {
   const jobId = randomUUID();
+  let payload:
+    | {
+        targetName: string;
+        chunkIndices?: number[];
+        voiceName?: string;
+        regenerateAll?: boolean;
+        regenerateOnlyMissing?: boolean;
+      }
+    | undefined;
   try {
-    const targetName = requireTargetName(req.body);
-    const chunkIndices = parseChunkIndices(req.body?.chunkIndices);
-    const voiceName = parseOptionalString(req.body?.voiceName, "`voiceName`");
-    const regenerateAll = parseOptionalBoolean(
-      req.body?.regenerateAll,
-      "`regenerateAll`"
-    );
-
-    const result = await restartAudioCheckpoint({
-      targetName,
-      chunkIndices,
-      regenerateAll: regenerateAll ?? false,
-      voiceName,
-      jobId,
-    });
-
-    res.json({
-      jobId,
-      totalRequested: result.totalRequested,
-      successes: result.successes,
-      failures: result.failures,
-    });
+    payload = {
+      targetName: requireTargetName(req.body),
+      chunkIndices: parseChunkIndices(req.body?.chunkIndices),
+      voiceName: parseOptionalString(req.body?.voiceName, "`voiceName`"),
+      regenerateAll: parseOptionalBoolean(
+        req.body?.regenerateAll,
+        "`regenerateAll`"
+      ),
+      regenerateOnlyMissing: parseOptionalBoolean(
+        req.body?.regenerateOnlyMissing,
+        "`regenerateOnlyMissing`"
+      ),
+    };
   } catch (error) {
     handleRestartError(res, "audio", jobId, error);
+    return;
   }
+
+  if (!payload) {
+    return;
+  }
+
+  const {
+    targetName,
+    chunkIndices,
+    voiceName,
+    regenerateAll,
+    regenerateOnlyMissing,
+  } = payload;
+
+  res.status(202).json({
+    jobId,
+    status: "processing",
+    message: "Audio chunk regeneration scheduled.",
+  });
+
+  restartAudioCheckpoint({
+    targetName,
+    chunkIndices,
+    regenerateAll: regenerateAll ?? false,
+    regenerateOnlyMissing: regenerateOnlyMissing ?? false,
+    voiceName,
+    jobId,
+  })
+    .then((result) => {
+      console.log(
+        `[Job ${jobId}][audio] Restart requested for ${result.totalRequested} chunk(s). Successes: ${result.successes}, Failures: ${result.failures.length}.`
+      );
+    })
+    .catch((error) => {
+      console.error(
+        `[Job ${jobId}][audio] checkpoint restart failed after acknowledgement.`,
+        error
+      );
+    });
 });
 
 // Payload: { targetName: string, chunkIndices?: number[] }
-router.post("/tts/restart/accuracy", async (req: Request, res: Response) => {
+router.post("/tts/restart/accuracy", (req: Request, res: Response) => {
   const jobId = randomUUID();
+  let payload:
+    | {
+        targetName: string;
+        chunkIndices?: number[];
+      }
+    | undefined;
   try {
-    const targetName = requireTargetName(req.body);
-    const chunkIndices = parseChunkIndices(req.body?.chunkIndices);
-
-    const result = await restartAccuracyCheckpoint({
-      targetName,
-      chunkIndices,
-      jobId,
-    });
-
-    res.json({
-      jobId,
-      totalRequested: result.totalRequested,
-      successes: result.successes,
-      failures: result.failures,
-    });
+    payload = {
+      targetName: requireTargetName(req.body),
+      chunkIndices: parseChunkIndices(req.body?.chunkIndices),
+    };
   } catch (error) {
     handleRestartError(res, "accuracy", jobId, error);
+    return;
   }
+
+  if (!payload) {
+    return;
+  }
+
+  const { targetName, chunkIndices } = payload;
+
+  res.status(202).json({
+    jobId,
+    status: "processing",
+    message: "Accuracy verification scheduled.",
+  });
+
+  restartAccuracyCheckpoint({
+    targetName,
+    chunkIndices,
+    jobId,
+  })
+    .then((result) => {
+      console.log(
+        `[Job ${jobId}][accuracy] Restart requested for ${result.totalRequested} chunk(s). Successes: ${result.successes}, Failures: ${result.failures.length}.`
+      );
+    })
+    .catch((error) => {
+      console.error(
+        `[Job ${jobId}][accuracy] checkpoint restart failed after acknowledgement.`,
+        error
+      );
+    });
 });
 
 // Payload: { targetName: string }

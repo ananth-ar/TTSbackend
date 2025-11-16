@@ -12,12 +12,13 @@ export interface ProcessTexttoSpeechResult {
   requestDirectory: string;
 }
 
-export type GeminiTtsGenerationMode = "stream" | "batch";
+export type GeminiTtsGenerationMode = "stream" | "batch" | "parallel";
 
 export interface SynthesizeAudioOptions {
   jobId?: string;
   totalChunkCount?: number;
   modeOverride?: GeminiTtsGenerationMode;
+  parallelism?: number;
 }
 
 export interface RequestLayout {
@@ -147,6 +148,7 @@ export interface RestartAudioParams extends RestartCheckpointBaseParams {
   chunkIndices?: number[];
   voiceName?: string;
   regenerateAll?: boolean;
+  regenerateOnlyMissing?: boolean;
 }
 
 export interface RestartAudioResult {
