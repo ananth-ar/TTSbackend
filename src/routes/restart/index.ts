@@ -8,6 +8,13 @@ import {
   restartMergeCheckpoint,
   restartSsmlCheckpoint,
 } from "../../services/processTexttoSpeechService.ts";
+import {
+  loadChunkProcessingStates,
+  readAudioChunksManifestSnapshot,
+  readRequestMetadata,
+  resolveExistingRequestLayout,
+} from "../../services/tts/storage.ts";
+import type { ChunkProcessingState } from "../../services/tts/types.ts";
 
 const router = Router();
 
@@ -86,6 +93,58 @@ router.post("/tts/restart/chunks", async (req: Request, res: Response) => {
     handleRestartError(res, "chunks", jobId, error);
   }
 });
+
+// Payload: { targetName: string, text?: string, voiceName?: string }
+router.post(
+  "/tts/restart/full-check-restart",
+  async (req: Request, res: Response) => {
+    const jobId = randomUUID();
+    let payload:
+      | {
+          targetName: string;
+          text?: string;
+          voiceName?: string;
+        }
+      | undefined;
+    try {
+      payload = {
+        targetName: requireTargetName(req.body),
+        text: parseOptionalString(req.body?.text, "`text`"),
+        voiceName: parseOptionalString(req.body?.voiceName, "`voiceName`"),
+      };
+      await resolveExistingRequestLayout(payload.targetName);
+    } catch (error) {
+      handleRestartError(res, "full-check", jobId, error);
+      return;
+    }
+
+    if (!payload) {
+      return;
+    }
+
+    res.status(202).json({
+      jobId,
+      status: "processing",
+      message: "Full checkpoint restart scheduled.",
+    });
+
+    runFullCheckpointRestart({
+      ...payload,
+      jobId,
+    })
+      .then(() => {
+        console.log(
+          `[Job ${jobId}][full-check] Full checkpoint restart flow completed.`
+        );
+      })
+      .catch((error) => {
+        console.error(
+          `[Job ${jobId}][full-check] Restart flow failed after acknowledgement.`,
+          error
+        );
+      });
+  }
+);
 
 // Payload: { targetName: string, chunkIndices?: number[], voiceName?: string, regenerateAll?: boolean, regenerateOnlyMissing?: boolean, regenerateFailedAccuracyAudios?: boolean }
 router.post("/tts/restart/audio", (req: Request, res: Response) => {
@@ -233,6 +292,126 @@ router.post("/tts/restart/merge", async (req: Request, res: Response) => {
     handleRestartError(res, "merge", jobId, error);
   }
 });
+
+async function runFullCheckpointRestart(params: {
+  targetName: string;
+  text?: string;
+  voiceName?: string;
+  jobId: string;
+}): Promise<void> {
+  const { targetName, text, voiceName, jobId } = params;
+  const jobLabel = `[Job ${jobId}][full-check]`;
+  const layout = await resolveExistingRequestLayout(targetName);
+  let metadata = await readRequestMetadata(layout);
+  let manifest = await readAudioChunksManifestSnapshot(layout.requestDir);
+  let voiceForAudio = voiceName ?? metadata.voiceName;
+
+  if (!manifest?.chunks?.length) {
+    console.log(
+      `${jobLabel} No SSML manifest found. Restarting SSML checkpoint.`
+    );
+    await restartSsmlCheckpoint({
+      targetName,
+      text,
+      voiceName: voiceForAudio,
+      jobId,
+    });
+    manifest = await readAudioChunksManifestSnapshot(layout.requestDir);
+    metadata = await readRequestMetadata(layout);
+    voiceForAudio = voiceName ?? metadata.voiceName;
+  }
+
+  let chunkStates: ChunkProcessingState[] = manifest
+    ? await loadChunkProcessingStates(layout.requestDir)
+    : [];
+
+  if (
+    !chunkStates.length ||
+    (manifest && chunkStates.length < manifest.chunkCount)
+  ) {
+    console.log(
+      `${jobLabel} Regenerating chunk checkpoints before continuing.`
+    );
+    await restartChunkCheckpoint({
+      targetName,
+      jobId,
+    });
+    chunkStates = await loadChunkProcessingStates(layout.requestDir);
+    manifest = await readAudioChunksManifestSnapshot(layout.requestDir);
+  }
+
+  const audioTargetIndices = dedupeChunkIndices(
+    chunkStates
+      .filter(
+        (state) => !state.audioReady || state.accuracyStatus === "failed"
+      )
+      .map((state) => state.checkpoint.chunkIndex)
+  );
+
+  if (audioTargetIndices.length) {
+    console.log(
+      `${jobLabel} Regenerating audio for chunk(s): ${audioTargetIndices.join(
+        ", "
+      )}.`
+    );
+    await restartAudioCheckpoint({
+      targetName,
+      chunkIndices: audioTargetIndices,
+      regenerateOnlyMissing: true,
+      regenerateFailedAccuracyAudios: true,
+      voiceName: voiceForAudio,
+      jobId,
+    });
+    chunkStates = await loadChunkProcessingStates(layout.requestDir);
+    metadata = await readRequestMetadata(layout);
+    voiceForAudio = voiceName ?? metadata.voiceName;
+  }
+
+  const verificationTargets = dedupeChunkIndices(
+    chunkStates
+      .filter((state) => state.audioReady && !state.verified)
+      .map((state) => state.checkpoint.chunkIndex)
+  );
+
+  if (verificationTargets.length) {
+    console.log(
+      `${jobLabel} Running accuracy verification for chunk(s): ${verificationTargets.join(
+        ", "
+      )}.`
+    );
+    await restartAccuracyCheckpoint({
+      targetName,
+      chunkIndices: verificationTargets,
+      jobId,
+    });
+    chunkStates = await loadChunkProcessingStates(layout.requestDir);
+  }
+
+  const allVerified =
+    chunkStates.length > 0 && chunkStates.every((state) => state.verified);
+
+  if (allVerified) {
+    console.log(`${jobLabel} All chunks verified. Merging final audio.`);
+    await restartMergeCheckpoint({
+      targetName,
+      jobId,
+    });
+    return;
+  }
+
+  const pending = chunkStates
+    .filter((state) => !state.verified)
+    .map((state) => state.checkpoint.chunkIndex);
+  console.warn(
+    `${jobLabel} Skipping merge; pending or failed verification for chunk(s): ${pending.join(
+      ", "
+    )}.`
+  );
+}
+
+function dedupeChunkIndices(indices: number[]): number[] {
+  return Array.from(new Set(indices)).sort((left, right) => left - right);
+}
 
 export default router;
 
