@@ -6,7 +6,7 @@ import {
   DEFAULT_VOICE,
   GEMINI_TTS_REQUESTS_PER_DAY,
   MODEL_ID,
-  aiClient,
+  runWithGeminiClient,
 } from "../../config.ts";
 import { convertBase64ToWav, type AudioChunk } from "../../utils/audio.ts";
 import { writeJsonFile } from "../../utils/json.ts";
@@ -19,6 +19,7 @@ import {
   JobState,
   type BatchJob,
   type GenerateContentResponse,
+  type GoogleGenAI,
   type InlinedRequest,
   type InlinedResponse,
 } from "@google/genai";
@@ -175,18 +176,20 @@ export async function synthesizeAudioFromSsmlChunksBatch(
     const sortedPending = [...pendingIndexes].sort((a, b) => a - b);
 
     try {
-      const attemptResult = await runBatchAttempt({
-        ssmlChunks,
-        chunkIndexes: sortedPending,
-        voiceName: voice,
-        jobLabel,
-        pollIntervalMs: pollInterval,
-        maxWaitMs,
-        attempt,
-        totalAttempts: maxAttempts,
-        jobId: options?.jobId,
-        totalChunks,
-      });
+      const attemptResult = await runWithGeminiClient((client) =>
+        runBatchAttempt(client, {
+          ssmlChunks,
+          chunkIndexes: sortedPending,
+          voiceName: voice,
+          jobLabel,
+          pollIntervalMs: pollInterval,
+          maxWaitMs,
+          attempt,
+          totalAttempts: maxAttempts,
+          jobId: options?.jobId,
+          totalChunks,
+        })
+      );
 
       const { successes, failedIndexes } = analyzeBatchResponses(
         attemptResult.responses,
@@ -313,6 +316,7 @@ interface BatchAttemptResult {
 }
 
 async function runBatchAttempt(
+  client: GoogleGenAI,
   context: BatchAttemptContext
 ): Promise<BatchAttemptResult> {
   const {
@@ -340,7 +344,7 @@ async function runBatchAttempt(
 
   try {
     const displayName = createDisplayName(jobId, attempt);
-    const batchJob = await aiClient.batches.create({
+    const batchJob = await client.batches.create({
       model: MODEL_ID,
       src: inlineRequests,
       config: { displayName },
@@ -357,6 +361,7 @@ async function runBatchAttempt(
     );
 
     const completedJob = await pollBatchJob(
+      client,
       batchJob.name,
       jobLabel,
       pollIntervalMs,
@@ -484,6 +489,7 @@ function createInlineRequests(
 }
 
 async function pollBatchJob(
+  client: GoogleGenAI,
   jobName: string,
   jobLabel: string,
   pollIntervalMs: number,
@@ -493,7 +499,7 @@ async function pollBatchJob(
   let lastLoggedState: JobState | undefined;
 
   while (true) {
-    const job = await aiClient.batches.get({ name: jobName });
+    const job = await client.batches.get({ name: jobName });
     const state = job.state ?? JobState.JOB_STATE_UNSPECIFIED;
 
     if (state !== lastLoggedState) {

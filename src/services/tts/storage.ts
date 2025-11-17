@@ -213,6 +213,7 @@ export async function loadChunkProcessingStates(
       checkpoint,
       audioAttempts: audioStatus.attempt ?? 0,
       verificationAttempts: accuracyStatus.attempt ?? 0,
+      accuracyStatus: accuracyStatus.status,
       audioReady: hasAudioFile,
       verified: accuracyStatus.status === "success",
       audioFilePath: hasAudioFile ? audioFilePath : undefined,

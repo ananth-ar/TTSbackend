@@ -116,6 +116,7 @@ export async function restartAudioCheckpoint(
     chunkIndices,
     regenerateAll,
     regenerateOnlyMissing,
+    regenerateFailedAccuracyAudios,
     voiceName,
     jobId,
   } = params;
@@ -144,7 +145,30 @@ export async function restartAudioCheckpoint(
     return !state.audioReady;
   });
 
-  const targets = regenerateOnlyMissing ? missingTargets : defaultTargets;
+  const failedAccuracyTargets =
+    regenerateFailedAccuracyAudios && chunkStates.length
+      ? chunkStates.filter((state) => {
+          if (filterSet && !filterSet.has(state.checkpoint.chunkIndex)) {
+            return false;
+          }
+          return state.accuracyStatus === "failed";
+        })
+      : [];
+
+  const targets = (() => {
+    if (regenerateOnlyMissing) {
+      return dedupeChunkTargets([
+        ...missingTargets,
+        ...(regenerateFailedAccuracyAudios ? failedAccuracyTargets : []),
+      ]);
+    }
+
+    if (regenerateFailedAccuracyAudios) {
+      return dedupeChunkTargets([...defaultTargets, ...failedAccuracyTargets]);
+    }
+
+    return defaultTargets;
+  })();
 
   if (!targets.length) {
     throw new Error(
@@ -320,6 +344,19 @@ function selectChunkTargets(
   }
 
   return states.filter(predicate);
+}
+
+function dedupeChunkTargets(
+  candidates: ChunkProcessingState[]
+): ChunkProcessingState[] {
+  const byChunkIndex = new Map<number, ChunkProcessingState>();
+  candidates.forEach((state) =>
+    byChunkIndex.set(state.checkpoint.chunkIndex, state)
+  );
+
+  return Array.from(byChunkIndex.values()).sort(
+    (left, right) => left.checkpoint.chunkIndex - right.checkpoint.chunkIndex
+  );
 }
 
 function createJobLabel(jobId: string | undefined, phase: string): string {

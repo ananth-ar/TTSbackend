@@ -50,19 +50,9 @@ const GEMINI_TTS_MODES: Record<string, GeminiTtsGenerationMode> = {
 export const GEMINI_TTS_MODE: GeminiTtsGenerationMode =
   GEMINI_TTS_MODES[GEMINI_TTS_MODE_ENV ?? ""] ?? "stream";
 export const GEMINI_TTS_PARALLEL_CONCURRENCY = Number.parseInt(
-  process.env.GEMINI_TTS_PARALLEL_CONCURRENCY ?? "10",
+  process.env.GEMINI_TTS_PARALLEL_CONCURRENCY ?? "8",
   10
 );
-
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-
-if (!GEMINI_API_KEY) {
-  throw new Error("Set GEMINI_API_KEY before starting the server.");
-}
-
-export const aiClient = new GoogleGenAI({
-  apiKey: GEMINI_API_KEY,
-});
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
@@ -93,3 +83,247 @@ export const HF_INFERENCE_PROVIDER: InferenceProviderOrPolicy =
     ) &&
     (HF_INFERENCE_PROVIDER_ENV as InferenceProviderOrPolicy)) ||
   "hf-inference";
+
+function resolveGeminiApiKeys(
+  primaryKey: string | undefined,
+  additionalKeys: string | undefined
+): string[] {
+  const parsedAdditional = parseApiKeyList(additionalKeys);
+  const combined = [
+    normalizeApiKey(primaryKey),
+    ...parsedAdditional.map((key) => normalizeApiKey(key)),
+  ].filter((key): key is string => Boolean(key));
+
+  const uniqueKeys = Array.from(new Set(combined));
+  if (!uniqueKeys.length) {
+    throw new Error(
+      "Set GEMINI_API_KEY or GEMINI_API_KEYS before starting the server."
+    );
+  }
+
+  return uniqueKeys;
+}
+
+function parseApiKeyList(value: string | undefined): string[] {
+  if (!value) {
+    return [];
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return [];
+  }
+
+  if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) {
+        return parsed
+          .map((entry) => normalizeApiKey(entry))
+          .filter((key): key is string => Boolean(key));
+      }
+    } catch {
+      // Fall through to comma parsing below.
+    }
+  }
+
+  return trimmed
+    .split(",")
+    .map((segment) => normalizeApiKey(segment))
+    .filter((key): key is string => Boolean(key));
+}
+
+function normalizeApiKey(value: unknown): string | undefined {
+  if (typeof value === "string") {
+    const normalized = value.trim();
+    return normalized.length ? normalized : undefined;
+  }
+
+  return undefined;
+}
+
+class GeminiClientManager {
+  private readonly entries: GeminiClientEntry[];
+  private nextIndex = 0;
+
+  constructor(apiKeys: string[]) {
+    this.entries = apiKeys.map((apiKey, index) => ({
+      client: new GoogleGenAI({ apiKey }),
+      index,
+      redactedKey: redactApiKey(apiKey),
+    }));
+  }
+
+  get size(): number {
+    return this.entries.length;
+  }
+
+  async run<T>(executor: (client: GoogleGenAI) => Promise<T>): Promise<T> {
+    if (!this.entries.length) {
+      throw new Error("No Gemini API clients were configured.");
+    }
+
+    const tried = new Set<number>();
+    let lastError: unknown;
+
+    while (tried.size < this.entries.length) {
+      const entry = this.pickNextEntry();
+      tried.add(entry.index);
+
+      try {
+        return await executor(entry.client);
+      } catch (error) {
+        lastError = error;
+        if (!shouldRotateGeminiKey(error) || this.entries.length === 1) {
+          throw error;
+        }
+
+        console.warn(
+          `[Gemini] API key ${entry.index + 1}/${this.entries.length} (${entry.redactedKey}) hit a quota limit or rate cap; rotating to the next key.`
+        );
+      }
+    }
+
+    throw lastError ?? new Error("All Gemini API keys are exhausted.");
+  }
+
+  private pickNextEntry(): GeminiClientEntry {
+    if (!this.entries.length) {
+      throw new Error("No Gemini API clients were configured.");
+    }
+
+    if (this.entries.length === 1) {
+      const singleEntry = this.entries[0];
+      if (!singleEntry) {
+        throw new Error("Gemini API client entry is missing.");
+      }
+      return singleEntry;
+    }
+
+    const entry = this.entries[this.nextIndex];
+    if (!entry) {
+      throw new Error("Gemini API client entry is missing.");
+    }
+    this.nextIndex = (this.nextIndex + 1) % this.entries.length;
+    return entry;
+  }
+}
+
+interface GeminiClientEntry {
+  client: GoogleGenAI;
+  index: number;
+  redactedKey: string;
+}
+
+function redactApiKey(key: string): string {
+  const trimmed = key.trim();
+  if (trimmed.length <= 8) {
+    return `${trimmed.slice(0, 4)}***`;
+  }
+
+  return `${trimmed.slice(0, 4)}…${trimmed.slice(-4)}`;
+}
+
+function shouldRotateGeminiKey(error: unknown): boolean {
+  if (!error) {
+    return false;
+  }
+
+  const numericCode = extractNumericStatus(error);
+  if (numericCode === 429) {
+    return true;
+  }
+
+  const statusText = `${extractStatusText(error)} ${extractErrorMessage(error)}`.toLowerCase();
+  return (
+    statusText.includes("quota") ||
+    statusText.includes("resource_exhausted") ||
+    statusText.includes("too many requests") ||
+    statusText.includes("rate limit")
+  );
+}
+
+function extractNumericStatus(error: unknown): number | undefined {
+  if (!error || typeof error !== "object") {
+    return undefined;
+  }
+
+  const candidateValues: Array<number | undefined> = [];
+  const topLevel = error as Record<string, unknown>;
+
+  candidateValues.push(asNumber(topLevel.code));
+  candidateValues.push(asNumber(topLevel.status));
+
+  if (typeof topLevel.error === "object" && topLevel.error) {
+    const nested = topLevel.error as Record<string, unknown>;
+    candidateValues.push(asNumber(nested.code));
+    candidateValues.push(asNumber(nested.status));
+  }
+
+  return candidateValues.find((value) => typeof value === "number");
+}
+
+function asNumber(value: unknown): number | undefined {
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : undefined;
+  }
+
+  if (typeof value === "string") {
+    const parsed = Number.parseInt(value, 10);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+
+  return undefined;
+}
+
+function extractStatusText(error: unknown): string {
+  if (!error || typeof error !== "object") {
+    return "";
+  }
+
+  const topLevel = error as Record<string, unknown>;
+  const statusValues: unknown[] = [
+    topLevel.status,
+    topLevel.error && typeof topLevel.error === "object"
+      ? (topLevel.error as Record<string, unknown>).status
+      : undefined,
+  ];
+
+  return statusValues
+    .map((value) => (typeof value === "string" ? value : ""))
+    .filter(Boolean)
+    .join(" ");
+}
+
+function extractErrorMessage(error: unknown): string {
+  if (!error) {
+    return "";
+  }
+
+  if (typeof error === "string") {
+    return error;
+  }
+
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return String(error);
+  }
+}
+
+const geminiApiKeys = resolveGeminiApiKeys(
+  process.env.GEMINI_API_KEY,
+  process.env.GEMINI_API_KEYS
+);
+
+export const geminiClientManager = new GeminiClientManager(geminiApiKeys);
+
+export function runWithGeminiClient<T>(
+  executor: (client: GoogleGenAI) => Promise<T>
+): Promise<T> {
+  return geminiClientManager.run(executor);
+}

@@ -1,6 +1,7 @@
 import mime from "mime";
 import path from "node:path";
 import { readFile, writeFile } from "node:fs/promises";
+import type { GoogleGenAI } from "@google/genai";
 
 import {
   GEMINI_TTS_MODE,
@@ -9,7 +10,7 @@ import {
   GEMINI_TTS_TOKENS_PER_MINUTE,
   DEFAULT_VOICE,
   MODEL_ID,
-  aiClient,
+  runWithGeminiClient,
 } from "../../config.ts";
 import { ensureDirectory } from "../../utils/fs.ts";
 import { combineAudioChunks, convertBase64ToWav, type AudioChunk } from "../../utils/audio.ts";
@@ -330,44 +331,48 @@ const BASE_TTS_RETRY_DELAY_MS = 1_000;
 const TTS_RETRY_BACKOFF_FACTOR = 2;
 
 async function generateAudioWithRetry(options: GenerateAudioRequest): Promise<AudioChunk> {
-  const { ssml, voiceName, jobLabel, chunkNumber, totalChunks } = options;
-  let attempt = 0;
-  let lastError: unknown;
+  return runWithGeminiClient(async (client) => {
+    const { ssml, voiceName, jobLabel, chunkNumber, totalChunks } = options;
+    let attempt = 0;
+    let lastError: unknown;
 
-  while (attempt < MAX_TTS_STREAM_ATTEMPTS) {
-    attempt += 1;
-    try {
-      return await generateAudioFromSsml(
-        ssml,
-        voiceName,
-        jobLabel,
-        chunkNumber,
-        totalChunks
-      );
-    } catch (error) {
-      lastError = error;
+    while (attempt < MAX_TTS_STREAM_ATTEMPTS) {
+      attempt += 1;
+      try {
+        return await generateAudioFromSsml(
+          client,
+          ssml,
+          voiceName,
+          jobLabel,
+          chunkNumber,
+          totalChunks
+        );
+      } catch (error) {
+        lastError = error;
 
-      if (!shouldRetryTtsError(error) || attempt >= MAX_TTS_STREAM_ATTEMPTS) {
-        break;
+        if (!shouldRetryTtsError(error) || attempt >= MAX_TTS_STREAM_ATTEMPTS) {
+          break;
+        }
+
+        const backoffDelay =
+          BASE_TTS_RETRY_DELAY_MS * Math.pow(TTS_RETRY_BACKOFF_FACTOR, attempt - 1);
+        console.warn(
+          `${jobLabel}Chunk ${chunkNumber}/${totalChunks} attempt ${attempt} failed (${error instanceof Error ? error.message : String(
+            error
+          )}). Retrying in ${backoffDelay}ms.`
+        );
+        await delay(backoffDelay);
       }
-
-      const backoffDelay =
-        BASE_TTS_RETRY_DELAY_MS * Math.pow(TTS_RETRY_BACKOFF_FACTOR, attempt - 1);
-      console.warn(
-        `${jobLabel}Chunk ${chunkNumber}/${totalChunks} attempt ${attempt} failed (${error instanceof Error ? error.message : String(
-          error
-        )}). Retrying in ${backoffDelay}ms.`
-      );
-      await delay(backoffDelay);
     }
-  }
 
-  throw lastError instanceof Error
-    ? lastError
-    : new Error("Gemini audio request failed after retries.");
+    throw lastError instanceof Error
+      ? lastError
+      : new Error("Gemini audio request failed after retries.");
+  });
 }
 
 async function generateAudioFromSsml(
+  client: GoogleGenAI,
   ssml: string,
   voiceName: string,
   jobLabel: string,
@@ -385,7 +390,7 @@ async function generateAudioFromSsml(
     },
   ];
 
-  const response = await aiClient.models.generateContentStream({
+  const response = await client.models.generateContentStream({
     model: MODEL_ID,
     config: {
       temperature: 0.7,

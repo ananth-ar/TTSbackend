@@ -87,7 +87,7 @@ router.post("/tts/restart/chunks", async (req: Request, res: Response) => {
   }
 });
 
-// Payload: { targetName: string, chunkIndices?: number[], voiceName?: string, regenerateAll?: boolean, regenerateOnlyMissing?: boolean }
+// Payload: { targetName: string, chunkIndices?: number[], voiceName?: string, regenerateAll?: boolean, regenerateOnlyMissing?: boolean, regenerateFailedAccuracyAudios?: boolean }
 router.post("/tts/restart/audio", (req: Request, res: Response) => {
   const jobId = randomUUID();
   let payload:
@@ -97,6 +97,7 @@ router.post("/tts/restart/audio", (req: Request, res: Response) => {
         voiceName?: string;
         regenerateAll?: boolean;
         regenerateOnlyMissing?: boolean;
+        regenerateFailedAccuracyAudios?: boolean;
       }
     | undefined;
   try {
@@ -111,6 +112,10 @@ router.post("/tts/restart/audio", (req: Request, res: Response) => {
       regenerateOnlyMissing: parseOptionalBoolean(
         req.body?.regenerateOnlyMissing,
         "`regenerateOnlyMissing`"
+      ),
+      regenerateFailedAccuracyAudios: parseOptionalBoolean(
+        req.body?.regenerateFailedAccuracyAudios,
+        "`regenerateFailedAccuracyAudios`"
       ),
     };
   } catch (error) {
@@ -128,6 +133,7 @@ router.post("/tts/restart/audio", (req: Request, res: Response) => {
     voiceName,
     regenerateAll,
     regenerateOnlyMissing,
+    regenerateFailedAccuracyAudios,
   } = payload;
 
   res.status(202).json({
@@ -141,6 +147,7 @@ router.post("/tts/restart/audio", (req: Request, res: Response) => {
     chunkIndices,
     regenerateAll: regenerateAll ?? false,
     regenerateOnlyMissing: regenerateOnlyMissing ?? false,
+    regenerateFailedAccuracyAudios: regenerateFailedAccuracyAudios ?? false,
     voiceName,
     jobId,
   })

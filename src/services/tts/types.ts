@@ -78,6 +78,7 @@ export interface ChunkProcessingState {
   checkpoint: ChunkCheckpoint;
   audioAttempts: number;
   verificationAttempts: number;
+  accuracyStatus?: StatusSnapshot["status"];
   audioReady: boolean;
   verified: boolean;
   audioFilePath?: string;
@@ -149,6 +150,7 @@ export interface RestartAudioParams extends RestartCheckpointBaseParams {
   voiceName?: string;
   regenerateAll?: boolean;
   regenerateOnlyMissing?: boolean;
+  regenerateFailedAccuracyAudios?: boolean;
 }
 
 export interface RestartAudioResult {
