@@ -12,12 +12,14 @@ import {
   MODEL_ID,
   runWithGeminiClient,
 } from "../../config.ts";
+import { logGeminiRequest, logGeminiResponse } from "./geminiLogger.ts";
 import { ensureDirectory } from "../../utils/fs.ts";
 import { combineAudioChunks, convertBase64ToWav, type AudioChunk } from "../../utils/audio.ts";
 import { countTokens } from "../../utils/text.ts";
 import { writeJsonFile } from "../../utils/json.ts";
 import type {
   ChunkAudioJobResult,
+  GeminiTtsGenerationMode,
   PersistedAudio,
   SsmlChunkTask,
   SynthesizeAudioOptions,
@@ -84,6 +86,7 @@ async function synthesizeAudioFromSsmlChunksStream(
       voice,
       jobLabel,
       totalChunkCount,
+      mode: "stream",
     });
     results.push(result);
   }
@@ -129,6 +132,7 @@ async function synthesizeAudioFromSsmlChunksParallel(
         voice,
         jobLabel,
         totalChunkCount,
+        mode: "parallel",
       });
       results.push(result);
     }
@@ -143,13 +147,14 @@ interface ChunkSynthesisContext {
   voice: string;
   jobLabel: string;
   totalChunkCount: number;
+  mode: GeminiTtsGenerationMode;
 }
 
 async function runChunkSynthesisTask(
   task: SsmlChunkTask,
   context: ChunkSynthesisContext
 ): Promise<ChunkAudioJobResult> {
-  const { voice, jobLabel, totalChunkCount } = context;
+  const { voice, jobLabel, totalChunkCount, mode } = context;
   const chunkNumber = task.chunkIndex;
   const chunkLabel = `${chunkNumber}/${totalChunkCount}`;
 
@@ -192,6 +197,7 @@ async function runChunkSynthesisTask(
   }
 
   const tokensNeeded = Math.max(1, countTokens(normalized));
+  const requestSizeBytes = Buffer.byteLength(normalized, "utf8");
   console.log(
     `${jobLabel}Queueing chunk ${chunkLabel} (~${tokensNeeded} tokens).`
   );
@@ -217,6 +223,9 @@ async function runChunkSynthesisTask(
       jobLabel,
       chunkNumber,
       totalChunks: totalChunkCount,
+      mode,
+      tokenCount: tokensNeeded,
+      requestSizeBytes,
     });
 
     const extension = mime.getExtension(chunkAudio.mimeType) ?? "wav";
@@ -324,6 +333,9 @@ interface GenerateAudioRequest {
   jobLabel: string;
   chunkNumber: number;
   totalChunks: number;
+  mode: GeminiTtsGenerationMode;
+  tokenCount: number;
+  requestSizeBytes: number;
 }
 
 const MAX_TTS_STREAM_ATTEMPTS = 3;
@@ -332,14 +344,32 @@ const TTS_RETRY_BACKOFF_FACTOR = 2;
 
 async function generateAudioWithRetry(options: GenerateAudioRequest): Promise<AudioChunk> {
   return runWithGeminiClient(async (client) => {
-    const { ssml, voiceName, jobLabel, chunkNumber, totalChunks } = options;
+    const {
+      ssml,
+      voiceName,
+      jobLabel,
+      chunkNumber,
+      totalChunks,
+      mode,
+      tokenCount,
+      requestSizeBytes,
+    } = options;
     let attempt = 0;
     let lastError: unknown;
 
     while (attempt < MAX_TTS_STREAM_ATTEMPTS) {
       attempt += 1;
+      const label = createChunkLogLabel(chunkNumber, totalChunks);
+
+      await logGeminiRequest({
+        mode,
+        label,
+        tokens: tokenCount,
+        requestBytes: requestSizeBytes,
+      });
+
       try {
-        return await generateAudioFromSsml(
+        const result = await generateAudioFromSsml(
           client,
           ssml,
           voiceName,
@@ -347,8 +377,28 @@ async function generateAudioWithRetry(options: GenerateAudioRequest): Promise<Au
           chunkNumber,
           totalChunks
         );
+
+        await logGeminiResponse({
+          mode,
+          label,
+          status: "success",
+          tokens: tokenCount,
+          requestBytes: requestSizeBytes,
+          responseBytes: result.buffer.length,
+        });
+
+        return result;
       } catch (error) {
         lastError = error;
+
+        await logGeminiResponse({
+          mode,
+          label,
+          status: "failure",
+          tokens: tokenCount,
+          requestBytes: requestSizeBytes,
+          error: summarizeError(error),
+        });
 
         if (!shouldRetryTtsError(error) || attempt >= MAX_TTS_STREAM_ATTEMPTS) {
           break;
@@ -473,6 +523,27 @@ function shouldRetryTtsError(error: unknown): boolean {
   }
 
   return false;
+}
+
+function summarizeError(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  if (typeof error === "string") {
+    return error;
+  }
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return String(error);
+  }
+}
+
+function createChunkLogLabel(
+  chunkNumber: number,
+  totalChunks: number
+): string {
+  return `chunk ${chunkNumber}/${totalChunks}`;
 }
 
 class TtsRateLimiter {

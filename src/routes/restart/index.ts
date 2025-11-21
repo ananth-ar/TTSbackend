@@ -104,13 +104,19 @@ router.post(
           targetName: string;
           text?: string;
           voiceName?: string;
+          reRunCount?: number;
         }
       | undefined;
     try {
+      const reRunCount = parseOptionalNonNegativeInteger(
+        req.body?.reRun,
+        "`reRun`"
+      );
       payload = {
         targetName: requireTargetName(req.body),
         text: parseOptionalString(req.body?.text, "`text`"),
         voiceName: parseOptionalString(req.body?.voiceName, "`voiceName`"),
+        reRunCount,
       };
       await resolveExistingRequestLayout(payload.targetName);
     } catch (error) {
@@ -298,7 +304,50 @@ async function runFullCheckpointRestart(params: {
   text?: string;
   voiceName?: string;
   jobId: string;
+  reRunCount?: number;
 }): Promise<void> {
+  const { jobId, reRunCount = 0, ...rest } = params;
+  const attempts = Math.max(0, reRunCount) + 1;
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    if (attempt > 1) {
+      console.log(
+        `[Job ${jobId}][full-check] Starting re-run ${attempt} of ${attempts}.`
+      );
+    }
+
+    const wasCompleted = await runFullCheckpointRestartAttempt({
+      ...rest,
+      jobId,
+    });
+
+    if (wasCompleted) {
+      if (attempt > 1) {
+        console.log(
+          `[Job ${jobId}][full-check] Re-run completed successfully on attempt ${attempt}.`
+        );
+      }
+      return;
+    }
+
+    if (attempt < attempts) {
+      console.log(
+        `[Job ${jobId}][full-check] Re-running full checkpoint restart after pending verifications remained.`
+      );
+    }
+  }
+
+  console.warn(
+    `[Job ${jobId}][full-check] Completed ${attempts} attempt(s) with pending or failed verifications remaining.`
+  );
+}
+
+async function runFullCheckpointRestartAttempt(params: {
+  targetName: string;
+  text?: string;
+  voiceName?: string;
+  jobId: string;
+}): Promise<boolean> {
   const { targetName, text, voiceName, jobId } = params;
   const jobLabel = `[Job ${jobId}][full-check]`;
   const layout = await resolveExistingRequestLayout(targetName);
@@ -342,9 +391,7 @@ async function runFullCheckpointRestart(params: {
 
   const audioTargetIndices = dedupeChunkIndices(
     chunkStates
-      .filter(
-        (state) => !state.audioReady || state.accuracyStatus === "failed"
-      )
+      .filter((state) => !state.audioReady || state.accuracyStatus === "failed")
       .map((state) => state.checkpoint.chunkIndex)
   );
 
@@ -396,7 +443,7 @@ async function runFullCheckpointRestart(params: {
       targetName,
       jobId,
     });
-    return;
+    return true;
   }
 
   const pending = chunkStates
@@ -407,6 +454,8 @@ async function runFullCheckpointRestart(params: {
       ", "
     )}.`
   );
+
+  return false;
 }
 
 function dedupeChunkIndices(indices: number[]): number[] {
@@ -442,6 +491,31 @@ function parseOptionalString(
   }
 
   return value;
+}
+
+function parseOptionalNonNegativeInteger(
+  value: unknown,
+  fieldLabel: string
+): number | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+
+  const parsedValue =
+    typeof value === "string" && value.trim().length ? Number(value) : value;
+
+  if (
+    typeof parsedValue !== "number" ||
+    Number.isNaN(parsedValue) ||
+    !Number.isInteger(parsedValue) ||
+    parsedValue < 0
+  ) {
+    throw new PayloadValidationError(
+      `${fieldLabel} must be a non-negative integer.`
+    );
+  }
+
+  return parsedValue;
 }
 
 function parseChunkIndices(value: unknown): number[] | undefined {

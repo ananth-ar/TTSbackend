@@ -1,6 +1,7 @@
 import mime from "mime";
 import path from "node:path";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, writeFile, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 
 import {
   DEFAULT_VOICE,
@@ -9,12 +10,14 @@ import {
   runWithGeminiClient,
 } from "../../config.ts";
 import { convertBase64ToWav, type AudioChunk } from "../../utils/audio.ts";
+import { countTokens } from "../../utils/text.ts";
 import { writeJsonFile } from "../../utils/json.ts";
 import type {
   ChunkAudioJobResult,
   SsmlChunkTask,
   SynthesizeAudioOptions,
 } from "./types.ts";
+import { logGeminiRequest, logGeminiResponse } from "./geminiLogger.ts";
 import {
   JobState,
   type BatchJob,
@@ -22,12 +25,15 @@ import {
   type GoogleGenAI,
   type InlinedRequest,
   type InlinedResponse,
+  type BatchJobSourceUnion,
+  type JobError,
 } from "@google/genai";
 
 const DEFAULT_POLL_INTERVAL_MS = 30_000;
 const DEFAULT_MAX_WAIT_MS = 24 * 60 * 60 * 1000; // 24 hours
 const DEFAULT_MAX_BATCH_ATTEMPTS = 3;
 const DEFAULT_RETRY_DELAY_MS = 5_000;
+const INLINE_REQUEST_SIZE_LIMIT_BYTES = 15 * 1024 * 1024; // Stay under 20MB inline cap
 const TERMINAL_STATES: Set<JobState> = new Set([
   JobState.JOB_STATE_SUCCEEDED,
   JobState.JOB_STATE_PARTIALLY_SUCCEEDED,
@@ -41,6 +47,14 @@ export interface BatchSynthesizeAudioOptions extends SynthesizeAudioOptions {
   maxWaitMs?: number;
   maxBatchAttempts?: number;
   retryDelayMs?: number;
+}
+
+interface BatchSource {
+  mode: "inline" | "file";
+  src: BatchJobSourceUnion;
+  mapping: number[];
+  keyMap?: Map<string, number>;
+  cleanup?: () => Promise<void>;
 }
 
 interface InlineDataPart {
@@ -57,6 +71,8 @@ interface BatchChunkContext {
   attempt: number;
   task: SsmlChunkTask;
   ssml: string;
+  tokenCount: number;
+  sizeBytes: number;
 }
 
 interface QuotaReservation {
@@ -142,6 +158,8 @@ export async function synthesizeAudioFromSsmlChunksBatch(
 
     const trimmed = ssml.trim();
     const zeroIndex = Math.max(0, chunkIndex - 1);
+    const tokenCount = Math.max(1, countTokens(trimmed));
+    const sizeBytes = Buffer.byteLength(trimmed, "utf8");
     const context: BatchChunkContext = {
       zeroIndex,
       chunkIndex,
@@ -149,6 +167,8 @@ export async function synthesizeAudioFromSsmlChunksBatch(
       attempt,
       task,
       ssml: trimmed,
+      tokenCount,
+      sizeBytes,
     };
 
     chunkContexts.set(zeroIndex, context);
@@ -188,16 +208,16 @@ export async function synthesizeAudioFromSsmlChunksBatch(
           totalAttempts: maxAttempts,
           jobId: options?.jobId,
           totalChunks,
+          chunkContexts,
         })
       );
 
-      const { successes, failedIndexes } = analyzeBatchResponses(
+      const { successes, failures } = analyzeBatchResponses(
         attemptResult.responses,
         sortedPending,
         totalChunks,
         jobLabel
       );
-
       await Promise.all(
         Array.from(successes.entries()).map(async ([zeroIndex, audio]) => {
           const context = chunkContexts.get(zeroIndex);
@@ -207,6 +227,15 @@ export async function synthesizeAudioFromSsmlChunksBatch(
             );
             return;
           }
+
+          await logGeminiResponse({
+            mode: "batch",
+            label: `batch chunk ${context.chunkLabel}`,
+            status: "success",
+            tokens: context.tokenCount,
+            requestBytes: context.sizeBytes,
+            responseBytes: audio.buffer.length,
+          });
 
           const persisted = await persistBatchChunkAudio(
             context,
@@ -218,16 +247,45 @@ export async function synthesizeAudioFromSsmlChunksBatch(
         })
       );
 
-      const failedSet = new Set<number>(failedIndexes);
+      const failureReasons = new Map<number, string>(failures);
+
+      sortedPending.forEach((index) => {
+        if (successes.has(index)) {
+          return;
+        }
+        if (!failureReasons.has(index)) {
+          failureReasons.set(
+            index,
+            "missing response in attempt"
+          );
+          console.warn(
+            `${jobLabel}Chunk ${index + 1}/${totalChunks} missing from inline responses; scheduling retry.`
+          );
+        }
+      });
 
       if (attemptResult.state !== JobState.JOB_STATE_SUCCEEDED) {
         console.warn(
           `${jobLabel}Batch job state ${attemptResult.state} indicates incomplete synthesis for attempt ${attempt}/${maxAttempts}.`
         );
-        sortedPending.forEach((index) => failedSet.add(index));
+        sortedPending.forEach((index) => {
+          if (successes.has(index)) {
+            return;
+          }
+          const reason = `job state ${attemptResult.state}`;
+          const existing = failureReasons.get(index);
+          failureReasons.set(index, existing ? `${existing}; ${reason}` : reason);
+        });
       }
 
-      pendingIndexes = sortedPending.filter((index) => failedSet.has(index));
+      await logBatchFailures(
+        failureReasons,
+        chunkContexts
+      );
+
+      pendingIndexes = sortedPending.filter((index) =>
+        failureReasons.has(index)
+      );
 
       if (pendingIndexes.length && attempt < maxAttempts) {
         console.warn(
@@ -308,6 +366,7 @@ interface BatchAttemptContext {
   totalAttempts: number;
   jobId?: string;
   totalChunks: number;
+  chunkContexts: Map<number, BatchChunkContext>;
 }
 
 interface BatchAttemptResult {
@@ -329,24 +388,37 @@ async function runBatchAttempt(
     attempt,
     totalAttempts,
     jobId,
+    chunkContexts,
   } = context;
 
   if (!chunkIndexes.length) {
     throw new Error("Batch attempt invoked without chunk indexes.");
   }
 
+  await logBatchChunkRequests(
+    chunkIndexes,
+    chunkContexts
+  );
+
   console.log(
     `${jobLabel}Batch attempt ${attempt}/${totalAttempts} queuing ${chunkIndexes.length} chunk(s).`
   );
 
-  const inlineRequests = createInlineRequests(ssmlChunks, chunkIndexes, voiceName);
   const quotaReservation = batchQuota.reserve(chunkIndexes.length, jobLabel);
+  let source: BatchSource | undefined;
 
   try {
+    source = await prepareBatchSource(
+      client,
+      ssmlChunks,
+      chunkIndexes,
+      voiceName,
+      jobLabel
+    );
     const displayName = createDisplayName(jobId, attempt);
     const batchJob = await client.batches.create({
       model: MODEL_ID,
-      src: inlineRequests,
+      src: source.src,
       config: { displayName },
     });
 
@@ -369,24 +441,37 @@ async function runBatchAttempt(
     );
 
     const responses = completedJob.dest?.inlinedResponses ?? [];
-    if (!responses.length) {
-      if (completedJob.dest?.fileName) {
-        throw new Error(
-          `${jobLabel}Batch job ${batchJob.name} produced a file output (${completedJob.dest.fileName}) instead of inline responses.`
-        );
-      }
-      throw new Error(
-        `${jobLabel}Batch job ${batchJob.name} returned no inline responses.`
-      );
+    const finalResponses =
+      responses.length > 0
+        ? responses
+        : completedJob.dest?.fileName
+        ? await fetchBatchFileResponses(
+            client,
+            completedJob.dest.fileName,
+            source.mapping,
+            source.keyMap,
+            jobLabel
+          )
+        : [];
+
+    if (!finalResponses.length) {
+      throw new Error(`${jobLabel}Batch job ${batchJob.name} returned no responses.`);
     }
 
     return {
-      responses,
+      responses: finalResponses,
       state: completedJob.state ?? JobState.JOB_STATE_UNSPECIFIED,
     };
   } catch (error) {
     quotaReservation.release();
+    await logBatchAttemptError(
+      chunkIndexes,
+      chunkContexts,
+      error
+    );
     throw error;
+  } finally {
+    await source?.cleanup?.();
   }
 }
 
@@ -397,10 +482,10 @@ function analyzeBatchResponses(
   jobLabel: string
 ): {
   successes: Map<number, AudioChunk>;
-  failedIndexes: number[];
+  failures: Map<number, string>;
 } {
   const successes = new Map<number, AudioChunk>();
-  const failed = new Set<number>();
+  const failures = new Map<number, string>();
   const seenIndexes = new Set<number>();
 
   responses.forEach((response, responseIndex) => {
@@ -424,7 +509,7 @@ function analyzeBatchResponses(
       console.error(
         `${jobLabel}Chunk ${chunkIndex + 1}/${totalChunks} failed: ${details}`
       );
-      failed.add(chunkIndex);
+      failures.set(chunkIndex, details);
       return;
     }
 
@@ -438,20 +523,96 @@ function analyzeBatchResponses(
     if (audio) {
       successes.set(chunkIndex, audio);
     } else {
-      failed.add(chunkIndex);
+      failures.set(chunkIndex, "missing inline audio data");
     }
   });
 
   expectedIndexes.forEach((chunkIndex) => {
     if (!seenIndexes.has(chunkIndex)) {
-      failed.add(chunkIndex);
+      failures.set(chunkIndex, "missing response payload");
       console.warn(
         `${jobLabel}Chunk ${chunkIndex + 1}/${totalChunks} missing from inline responses; scheduling retry.`
       );
     }
   });
 
-  return { successes, failedIndexes: Array.from(failed) };
+  return { successes, failures };
+}
+
+async function logBatchChunkRequests(
+  chunkIndexes: number[],
+  chunkContexts: Map<number, BatchChunkContext>
+): Promise<void> {
+  if (!chunkIndexes.length) {
+    return;
+  }
+
+  await Promise.all(
+    chunkIndexes.map(async (zeroIndex) => {
+      const context = chunkContexts.get(zeroIndex);
+      if (!context) {
+        return;
+      }
+      await logGeminiRequest({
+        mode: "batch",
+        label: `batch chunk ${context.chunkLabel}`,
+        tokens: context.tokenCount,
+        requestBytes: context.sizeBytes,
+      });
+    })
+  );
+}
+
+async function logBatchFailures(
+  failures: Map<number, string>,
+  chunkContexts: Map<number, BatchChunkContext>
+): Promise<void> {
+  if (!failures.size) {
+    return;
+  }
+
+  await Promise.all(
+    Array.from(failures.entries()).map(async ([zeroIndex, reason]) => {
+      const context = chunkContexts.get(zeroIndex);
+      const label = context
+        ? `batch chunk ${context.chunkLabel}`
+        : `batch chunk ${zeroIndex + 1}`;
+      await logGeminiResponse({
+        mode: "batch",
+        label,
+        status: "failure",
+        tokens: context?.tokenCount,
+        requestBytes: context?.sizeBytes,
+        error: summarizeError(reason),
+      });
+    })
+  );
+}
+
+async function logBatchAttemptError(
+  chunkIndexes: number[],
+  chunkContexts: Map<number, BatchChunkContext>,
+  error: unknown
+): Promise<void> {
+  const failures = new Map<number, string>();
+  const reason = summarizeError(error);
+  chunkIndexes.forEach((index) => failures.set(index, reason));
+
+  await logBatchFailures(failures, chunkContexts);
+}
+
+function summarizeError(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  if (typeof error === "string") {
+    return error;
+  }
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return String(error);
+  }
 }
 
 function createInlineRequests(
@@ -465,25 +626,10 @@ function createInlineRequests(
       throw new Error(`Missing SSML chunk at index ${chunkIndex}.`);
     }
 
+    const request = createRequestPayload(chunk, voiceName);
     return {
-      contents: [
-        {
-          role: "user" as const,
-          parts: [{ text: chunk }],
-        },
-      ],
+      ...request,
       metadata: { chunkIndex: `${chunkIndex}` },
-      config: {
-        temperature: 0.7,
-        responseModalities: ["AUDIO"],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: {
-              voiceName,
-            },
-          },
-        },
-      },
     };
   });
 }
@@ -775,4 +921,225 @@ function formatChunkList(indexes: number[]): string {
     .sort((a, b) => a - b)
     .map((value) => `${value + 1}`)
     .join(", ");
+}
+
+function createRequestPayload(chunk: string, voiceName: string) {
+  return {
+    contents: [
+      {
+        role: "user" as const,
+        parts: [{ text: chunk }],
+      },
+    ],
+    config: {
+      temperature: 0.7,
+      responseModalities: ["AUDIO"],
+      speechConfig: {
+        voiceConfig: {
+          prebuiltVoiceConfig: {
+            voiceName,
+          },
+        },
+      },
+    },
+  };
+}
+
+async function prepareBatchSource(
+  client: GoogleGenAI,
+  ssmlChunks: string[],
+  chunkIndexes: number[],
+  voiceName: string,
+  jobLabel: string
+): Promise<BatchSource> {
+  let tempDir: string | undefined;
+
+  const inlineRequests = createInlineRequests(ssmlChunks, chunkIndexes, voiceName);
+  const inlineBytes = estimateInlineBytes(inlineRequests);
+
+  if (inlineBytes <= INLINE_REQUEST_SIZE_LIMIT_BYTES) {
+    return {
+      mode: "inline",
+      src: inlineRequests,
+      mapping: chunkIndexes,
+    };
+  }
+
+  try {
+    tempDir = await mkdtemp(path.join(tmpdir(), "tts-batch-"));
+    const inputPath = path.join(tempDir, "requests.jsonl");
+    const keyMap = new Map<string, number>();
+
+    const lines = chunkIndexes.map((chunkIndex) => {
+      const chunk = ssmlChunks[chunkIndex];
+      if (typeof chunk !== "string") {
+        throw new Error(`Missing SSML chunk at index ${chunkIndex}.`);
+      }
+
+      const key = `chunk-${chunkIndex + 1}`;
+      keyMap.set(key, chunkIndex);
+
+      const request = createRequestPayload(chunk, voiceName);
+      return JSON.stringify({ key, request });
+    });
+
+    await writeFile(inputPath, lines.join("\n"), { encoding: "utf8" });
+
+    const uploaded = await client.files.upload({
+      file: inputPath,
+      config: {
+        mimeType: "application/jsonl",
+        displayName: `tts-batch-${Date.now()}`,
+      },
+    });
+
+    console.log(
+      `${jobLabel}Uploaded batch input file ${uploaded.name} (${lines.length} request(s)); using file-backed Batch job.`
+    );
+
+    const cleanup = async () => {
+      if (tempDir) {
+        await rm(tempDir, { recursive: true, force: true });
+      }
+    };
+
+    return {
+      mode: "file",
+      src: { fileName: uploaded.name, format: "jsonl" },
+      mapping: chunkIndexes,
+      keyMap,
+      cleanup,
+    };
+  } catch (error) {
+    if (tempDir) {
+      await rm(tempDir, { recursive: true, force: true }).catch(() => {
+        /* ignore cleanup errors */
+      });
+    }
+    throw error;
+  }
+}
+
+async function fetchBatchFileResponses(
+  client: GoogleGenAI,
+  fileName: string,
+  mapping: number[],
+  keyMap: Map<string, number> | undefined,
+  jobLabel: string
+): Promise<InlinedResponse[]> {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "tts-batch-out-"));
+  const downloadPath = path.join(tempDir, "responses.jsonl");
+
+  try {
+    await client.files.download({ file: fileName, downloadPath });
+    const content = await readFile(downloadPath, { encoding: "utf8" });
+    const lines = content
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+
+    console.log(
+      `${jobLabel}Downloaded batch result file ${fileName} with ${lines.length} line(s).`
+    );
+
+    const responses: InlinedResponse[] = [];
+
+    lines.forEach((line, index) => {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line);
+      } catch (error) {
+        console.warn(`${jobLabel}Skipping unreadable batch response line ${index + 1}.`, error);
+        return;
+      }
+
+      const chunkIndex = resolveChunkIndexFromLine(parsed, mapping, keyMap, index);
+      const { response, error } = normalizeBatchFileRecord(parsed);
+
+      const enriched: InlinedResponse = {};
+      if (chunkIndex !== undefined) {
+        (enriched as unknown as { metadata?: Record<string, string> }).metadata = {
+          chunkIndex: `${chunkIndex}`,
+        };
+      }
+      if (response) {
+        enriched.response = response;
+      }
+      if (error) {
+        enriched.error = error;
+      }
+      responses.push(enriched);
+    });
+
+    return responses;
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+function resolveChunkIndexFromLine(
+  parsed: unknown,
+  mapping: number[],
+  keyMap: Map<string, number> | undefined,
+  responseIndex: number
+): number | undefined {
+  if (parsed && typeof parsed === "object") {
+    const keyed = parsed as { key?: unknown };
+    if (typeof keyed.key === "string" && keyMap?.has(keyed.key)) {
+      return keyMap.get(keyed.key);
+    }
+  }
+
+  return mapping[responseIndex];
+}
+
+function normalizeBatchFileRecord(
+  parsed: unknown
+): { response?: GenerateContentResponse; error?: JobError } {
+  if (!parsed || typeof parsed !== "object") {
+    return {};
+  }
+
+  const record = parsed as Record<string, unknown>;
+  const rawResponse = record.response ?? (record.error ? undefined : parsed);
+  const rawError = record.error;
+
+  return {
+    response: rawResponse as GenerateContentResponse | undefined,
+    error: normalizeJobError(rawError),
+  };
+}
+
+function normalizeJobError(candidate: unknown): JobError | undefined {
+  if (!candidate || typeof candidate !== "object") {
+    return undefined;
+  }
+
+  const record = candidate as Record<string, unknown>;
+  const message =
+    typeof record.message === "string"
+      ? record.message
+      : typeof record.status === "string"
+      ? record.status
+      : undefined;
+  const details = Array.isArray(record.details)
+    ? record.details
+        .map((entry) => (typeof entry === "string" ? entry : undefined))
+        .filter((entry): entry is string => Boolean(entry))
+    : undefined;
+  const code = typeof record.code === "number" ? record.code : undefined;
+
+  if (!message && !details?.length && code === undefined) {
+    return undefined;
+  }
+
+  return { message, details, code };
+}
+
+function estimateInlineBytes(requests: InlinedRequest[]): number {
+  try {
+    return Buffer.byteLength(JSON.stringify(requests), "utf8");
+  } catch {
+    return Number.MAX_SAFE_INTEGER;
+  }
 }

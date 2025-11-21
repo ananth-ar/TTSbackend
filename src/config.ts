@@ -12,7 +12,7 @@ export const OUTPUT_DIR = path.resolve(process.cwd(), "output");
 export const PORT = Number.parseInt(process.env.PORT ?? "3000", 10);
 export const HOST = process.env.HOST ?? "0.0.0.0";
 export const MODEL_ID =
-  process.env.GEMINI_TTS_MODEL ?? "models/gemini-2.5-flash-preview-tts";
+  process.env.GEMINI_TTS_MODEL ?? "gemini-2.5-flash-preview-tts";
 export const DEFAULT_VOICE = process.env.GEMINI_TTS_VOICE ?? "Fenrir";
 export const MAX_WORD_COUNT = 100000;
 export const WORDS_PER_CHUNK = 600;
@@ -179,7 +179,9 @@ class GeminiClientManager {
         }
 
         console.warn(
-          `[Gemini] API key ${entry.index + 1}/${this.entries.length} (${entry.redactedKey}) hit a quota limit or rate cap; rotating to the next key.`
+          `[Gemini] API key ${entry.index + 1}/${this.entries.length} (${
+            entry.redactedKey
+          }) hit a quota limit or rate cap; rotating to the next key.`
         );
       }
     }
@@ -234,7 +236,9 @@ function shouldRotateGeminiKey(error: unknown): boolean {
     return true;
   }
 
-  const statusText = `${extractStatusText(error)} ${extractErrorMessage(error)}`.toLowerCase();
+  const statusText = `${extractStatusText(error)} ${extractErrorMessage(
+    error
+  )}`.toLowerCase();
   return (
     statusText.includes("quota") ||
     statusText.includes("resource_exhausted") ||
